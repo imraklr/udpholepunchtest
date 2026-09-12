@@ -1,47 +1,58 @@
 use std::io::{self, Write};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STUN_SERVER: &str = "stun.l.google.com:19302";
-const STUN_BINDING_REQUEST: u16 = 0x0001;
 
-// STUN magic cookie defined by RFC 5389.
+const STUN_BINDING_REQUEST: u16 = 0x0001;
+const STUN_BINDING_SUCCESS: u16 = 0x0101;
+
+// RFC 5389 magic cookie.
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 
+const HOLE_PUNCH_DURATION: Duration = Duration::from_secs(30);
+const SEND_INTERVAL: Duration = Duration::from_millis(500);
+
 fn main() -> io::Result<()> {
-    println!("=== UDP Hole Punching Test ===");
+    println!("========================================");
+    println!("       UDP HOLE PUNCHING TEST");
+    println!("========================================");
     println!();
 
     // ---------------------------------------------------------
-    // 1. Create UDP socket
+    // 1. Create IPv4 UDP socket
     // ---------------------------------------------------------
 
     let socket = UdpSocket::bind("0.0.0.0:0")?;
 
     let local_addr = socket.local_addr()?;
 
-    println!("Local UDP socket: {local_addr}");
+    println!("Local UDP socket:");
+    println!("    {local_addr}");
     println!();
 
     // ---------------------------------------------------------
-    // 2. Discover our public UDP endpoint using STUN
+    // 2. Discover public UDP endpoint using STUN
     // ---------------------------------------------------------
 
-    println!("Querying STUN server: {STUN_SERVER}");
+    println!("Querying STUN server:");
+    println!("    {STUN_SERVER}");
+    println!();
 
     let public_addr = stun_binding_request(&socket)?;
 
     println!();
-    println!("Your public UDP endpoint:");
-    println!("    {public_addr}");
+    println!("========================================");
+    println!("YOUR PUBLIC UDP ENDPOINT");
+    println!("========================================");
+    println!("{public_addr}");
     println!();
-
     println!("Give this address to the other laptop.");
     println!();
 
     // ---------------------------------------------------------
-    // 3. Ask for the other peer's public endpoint
+    // 3. Ask user for peer endpoint
     // ---------------------------------------------------------
 
     let peer_addr = loop {
@@ -49,164 +60,237 @@ fn main() -> io::Result<()> {
         io::stdout().flush()?;
 
         let mut input = String::new();
+
         io::stdin().read_line(&mut input)?;
 
-        match input.trim().parse::<SocketAddr>() {
-            Ok(addr) => break addr,
+        let input = input.trim();
+
+        match input.parse::<SocketAddr>() {
+            Ok(addr) if addr.is_ipv4() => {
+                break addr;
+            }
+
+            Ok(_) => {
+                println!("Please enter an IPv4 endpoint.");
+                println!("Example: 203.0.113.10:42137");
+            }
+
             Err(_) => {
-                println!("Invalid address. Example: 203.0.113.10:42137");
+                println!("Invalid endpoint.");
+                println!("Example: 203.0.113.10:42137");
             }
         }
     };
 
     println!();
-    println!("Peer endpoint: {peer_addr}");
+    println!("Peer endpoint:");
+    println!("    {peer_addr}");
     println!();
 
     // ---------------------------------------------------------
-    // 4. Start hole punching
+    // 4. Start UDP hole punching
     // ---------------------------------------------------------
 
-    println!("Starting UDP hole punching...");
-    println!("Both laptops should be running this program.");
+    println!("========================================");
+    println!("STARTING UDP HOLE PUNCHING");
+    println!("========================================");
+    println!();
+    println!("Both laptops should now be sending.");
+    println!("Sending packets every 500 ms for 30 seconds.");
     println!();
 
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     let receiver = socket.try_clone()?;
 
-    // Receiver thread.
+    // ---------------------------------------------------------
+    // Receiver thread
+    // ---------------------------------------------------------
+
     let receive_thread = thread::spawn(move || {
-        let mut buf = [0u8; 2048];
-
-        let start = Instant::now();
-
-        loop {
-            // Stop after 30 seconds.
-            if start.elapsed() > Duration::from_secs(30) {
-                break;
-            }
-
-            match receiver.recv_from(&mut buf) {
-                Ok((len, source)) => {
-                    let message = String::from_utf8_lossy(&buf[..len]);
-
-                    println!();
-                    println!("<<< RECEIVED FROM {source}");
-                    println!("<<< {message}");
-                    println!();
-
-                    if message.starts_with("HOLE_PUNCH") {
-                        println!("======================================");
-                        println!("SUCCESS: UDP hole punch established!");
-                        println!("======================================");
-                        println!();
-                    }
-                }
-
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    // Nothing received yet.
-                }
-
-                Err(e) => {
-                    eprintln!("Receive error: {e}");
-                    break;
-                }
-            }
-        }
+        receive_packets(receiver);
     });
 
     // ---------------------------------------------------------
-    // 5. Send packets repeatedly
+    // Sender
     // ---------------------------------------------------------
 
-    for i in 1..=60 {
+    let start = Instant::now();
+    let mut packet_number = 1u64;
+
+    while start.elapsed() < HOLE_PUNCH_DURATION {
         let message = format!(
-            "HOLE_PUNCH packet={} from={}",
-            i, local_addr
+            "HOLE_PUNCH packet={} local={}",
+            packet_number,
+            local_addr
         );
 
         match socket.send_to(message.as_bytes(), peer_addr) {
             Ok(bytes) => {
                 println!(
-                    ">>> Sent {} bytes to {} [packet {}]",
-                    bytes, peer_addr, i
+                    ">>> SENT {} bytes -> {} [packet {}]",
+                    bytes,
+                    peer_addr,
+                    packet_number
                 );
             }
 
-            Err(e) => {
-                eprintln!("Send error: {e}");
+            Err(error) => {
+                eprintln!("Send error: {error}");
             }
         }
 
-        thread::sleep(Duration::from_millis(500));
+        packet_number += 1;
+
+        thread::sleep(SEND_INTERVAL);
     }
 
     println!();
-    println!("Finished sending hole-punch packets.");
-    println!("Waiting for remaining packets...");
+    println!("========================================");
+    println!("SENDING FINISHED");
+    println!("========================================");
+    println!();
+    println!("Waiting for receiver thread...");
 
     receive_thread.join().ok();
 
     println!();
-    println!("Test finished.");
+    println!("========================================");
+    println!("TEST FINISHED");
+    println!("========================================");
 
     Ok(())
 }
 
 // =============================================================
-// STUN
+// Receiver
+// =============================================================
+
+fn receive_packets(socket: UdpSocket) {
+    let mut buffer = [0u8; 2048];
+
+    let start = Instant::now();
+
+    let mut received_any = false;
+
+    while start.elapsed() < HOLE_PUNCH_DURATION {
+        match socket.recv_from(&mut buffer) {
+            Ok((length, source)) => {
+                received_any = true;
+
+                let message =
+                    String::from_utf8_lossy(&buffer[..length]);
+
+                println!();
+                println!("<<< RECEIVED FROM {source}");
+                println!("<<< {message}");
+                println!();
+
+                if message.starts_with("HOLE_PUNCH") {
+                    println!("========================================");
+                    println!(" SUCCESS: UDP PACKET RECEIVED!");
+                    println!(" UDP HOLE PUNCHING APPEARS TO WORK!");
+                    println!("========================================");
+                    println!();
+                }
+            }
+
+            Err(error)
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                // Nothing received yet.
+            }
+
+            Err(error) => {
+                eprintln!("Receive error: {error}");
+                break;
+            }
+        }
+    }
+
+    if !received_any {
+        println!();
+        println!("No UDP packets were received from the peer.");
+        println!();
+        println!("Possible causes:");
+        println!("  - Incorrect peer public endpoint");
+        println!("  - NAT/firewall blocks UDP");
+        println!("  - Symmetric NAT");
+        println!("  - Router does not support this punching method");
+        println!("  - Windows Firewall is blocking the program");
+        println!();
+    }
+}
+
+// =============================================================
+// STUN Binding Request
 // =============================================================
 
 fn stun_binding_request(socket: &UdpSocket) -> io::Result<SocketAddr> {
-    let server: SocketAddr = STUN_SERVER
+    // ---------------------------------------------------------
+    // Resolve STUN server.
+    //
+    // IMPORTANT:
+    //
+    // The socket is IPv4, so explicitly select an IPv4
+    // destination. This fixes Windows error 10047.
+    // ---------------------------------------------------------
+
+    let server = STUN_SERVER
         .to_socket_addrs()?
-        .next()
+        .find(|address| address.is_ipv4())
         .ok_or_else(|| {
             io::Error::new(
-                io::ErrorKind::Other,
-                "Could not resolve STUN server",
+                io::ErrorKind::AddrNotAvailable,
+                "Could not resolve an IPv4 STUN server address",
             )
         })?;
 
+    println!("Using IPv4 STUN server:");
+    println!("    {server}");
+    println!();
+
     // ---------------------------------------------------------
-    // Construct STUN Binding Request
-    //
-    // STUN header:
-    //
-    // Bytes 0-1   : Message Type
-    // Bytes 2-3   : Message Length
-    // Bytes 4-7   : Magic Cookie
-    // Bytes 8-19  : Transaction ID
+    // Generate transaction ID
     // ---------------------------------------------------------
 
-    let mut packet = [0u8; 20];
-
-    // Message Type = Binding Request (0x0001)
-    packet[0..2].copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
-
-    // Message Length = 0
-    packet[2..4].copy_from_slice(&0u16.to_be_bytes());
-
-    // Magic Cookie
-    packet[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
-
-    // Transaction ID
-    //
-    // We don't need cryptographic randomness for this simple
-    // experiment. Generate a value based on the current time
-    // and local socket information.
     let transaction_id = generate_transaction_id(socket);
 
-    packet[8..20].copy_from_slice(&transaction_id);
+    // ---------------------------------------------------------
+    // Build STUN Binding Request
+    //
+    // Header:
+    //
+    // 0-1   Message Type
+    // 2-3   Message Length
+    // 4-7   Magic Cookie
+    // 8-19  Transaction ID
+    // ---------------------------------------------------------
 
-    // Send STUN request.
-    socket.send_to(&packet, server)?;
+    let mut request = [0u8; 20];
 
-    println!("STUN request sent to {server}");
+    // Binding Request = 0x0001
+    request[0..2]
+        .copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
+
+    // Message length = 0
+    request[2..4].copy_from_slice(&0u16.to_be_bytes());
+
+    // Magic cookie
+    request[4..8]
+        .copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+
+    // Transaction ID
+    request[8..20].copy_from_slice(&transaction_id);
+
+    // ---------------------------------------------------------
+    // Send request
+    // ---------------------------------------------------------
+
+    socket.send_to(&request, server)?;
+
+    println!("STUN request sent.");
 
     // ---------------------------------------------------------
     // Wait for response
@@ -214,26 +298,40 @@ fn stun_binding_request(socket: &UdpSocket) -> io::Result<SocketAddr> {
 
     socket.set_read_timeout(Some(Duration::from_secs(5)))?;
 
-    let mut response = [0u8; 2048];
+    let mut response = [0u8; 4096];
 
-    let (len, source) = socket.recv_from(&mut response)?;
+    let result = socket.recv_from(&mut response);
 
-    println!("STUN response received from {source}");
-
-    // Restore normal timeout later.
+    // Restore normal timeout.
     socket.set_read_timeout(None)?;
 
-    parse_stun_response(&response[..len], &transaction_id)
+    let (length, source) = result?;
+
+    println!("STUN response received from:");
+    println!("    {source}");
+
+    // ---------------------------------------------------------
+    // Parse response
+    // ---------------------------------------------------------
+
+    parse_stun_response(
+        &response[..length],
+        &transaction_id,
+    )
 }
 
 // =============================================================
-// STUN response parser
+// STUN Response Parser
 // =============================================================
 
 fn parse_stun_response(
     packet: &[u8],
     transaction_id: &[u8; 12],
 ) -> io::Result<SocketAddr> {
+    // ---------------------------------------------------------
+    // Minimum STUN header = 20 bytes
+    // ---------------------------------------------------------
+
     if packet.len() < 20 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -241,11 +339,14 @@ fn parse_stun_response(
         ));
     }
 
-    // Message type.
-    let message_type = u16::from_be_bytes([packet[0], packet[1]]);
+    // ---------------------------------------------------------
+    // Message type
+    // ---------------------------------------------------------
 
-    // Binding Success Response = 0x0101
-    if message_type != 0x0101 {
+    let message_type =
+        u16::from_be_bytes([packet[0], packet[1]]);
+
+    if message_type != STUN_BINDING_SUCCESS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -255,29 +356,21 @@ fn parse_stun_response(
         ));
     }
 
-    // Verify magic cookie.
-    let cookie =
-        u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-
-    if cookie != MAGIC_COOKIE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid STUN magic cookie",
-        ));
-    }
-
-    // Verify transaction ID.
-    if &packet[8..20] != transaction_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "STUN transaction ID does not match",
-        ));
-    }
+    // ---------------------------------------------------------
+    // Message length
+    // ---------------------------------------------------------
 
     let message_length =
         u16::from_be_bytes([packet[2], packet[3]]) as usize;
 
-    let end = 20 + message_length;
+    let end = 20usize
+        .checked_add(message_length)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid STUN message length",
+            )
+        })?;
 
     if packet.len() < end {
         return Err(io::Error::new(
@@ -287,62 +380,108 @@ fn parse_stun_response(
     }
 
     // ---------------------------------------------------------
-    // Parse STUN attributes.
+    // Magic cookie
     // ---------------------------------------------------------
 
-    let mut pos = 20;
+    let cookie =
+        u32::from_be_bytes([
+            packet[4],
+            packet[5],
+            packet[6],
+            packet[7],
+        ]);
 
-    while pos + 4 <= end {
-        let attr_type =
-            u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+    if cookie != MAGIC_COOKIE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid STUN magic cookie",
+        ));
+    }
 
-        let attr_len =
-            u16::from_be_bytes([packet[pos + 2], packet[pos + 3]])
-                as usize;
+    // ---------------------------------------------------------
+    // Transaction ID
+    // ---------------------------------------------------------
 
-        pos += 4;
+    if &packet[8..20] != transaction_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "STUN transaction ID does not match",
+        ));
+    }
 
-        if pos + attr_len > end {
+    // ---------------------------------------------------------
+    // Parse attributes
+    // ---------------------------------------------------------
+
+    let mut position = 20;
+
+    while position + 4 <= end {
+        let attribute_type =
+            u16::from_be_bytes([
+                packet[position],
+                packet[position + 1],
+            ]);
+
+        let attribute_length =
+            u16::from_be_bytes([
+                packet[position + 2],
+                packet[position + 3],
+            ]) as usize;
+
+        position += 4;
+
+        if position + attribute_length > end {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid STUN attribute length",
             ));
         }
 
-        let value = &packet[pos..pos + attr_len];
+        let value =
+            &packet[position..position + attribute_length];
 
-        match attr_type {
+        match attribute_type {
             // XOR-MAPPED-ADDRESS
             0x0020 => {
-                if let Some(addr) =
-                    parse_xor_mapped_address(value, transaction_id)
+                if let Some(address) =
+                    parse_xor_mapped_address(
+                        value,
+                        transaction_id,
+                    )
                 {
-                    return Ok(addr);
+                    return Ok(address);
                 }
             }
 
-            // MAPPED-ADDRESS (older STUN)
+            // MAPPED-ADDRESS
             0x0001 => {
-                if let Some(addr) = parse_mapped_address(value) {
-                    return Ok(addr);
+                if let Some(address) =
+                    parse_mapped_address(value)
+                {
+                    return Ok(address);
                 }
             }
 
-            _ => {}
+            _ => {
+                // Ignore other STUN attributes.
+            }
         }
 
-        // STUN attributes are padded to a 4-byte boundary.
-        pos += (attr_len + 3) & !3;
+        // STUN attributes are padded to 4 bytes.
+        let padded_length =
+            (attribute_length + 3) & !3;
+
+        position += padded_length;
     }
 
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "No XOR-MAPPED-ADDRESS or MAPPED-ADDRESS in STUN response",
+        "STUN response did not contain a usable mapped address",
     ))
 }
 
 // =============================================================
-// XOR-MAPPED-ADDRESS
+// Parse XOR-MAPPED-ADDRESS
 // =============================================================
 
 fn parse_xor_mapped_address(
@@ -353,13 +492,23 @@ fn parse_xor_mapped_address(
         return None;
     }
 
+    // First byte is reserved.
+    // Second byte is address family.
     let family = value[1];
 
+    // ---------------------------------------------------------
     // IPv4
+    // ---------------------------------------------------------
+
     if family == 0x01 {
+        let encoded_port =
+            u16::from_be_bytes([
+                value[2],
+                value[3],
+            ]);
+
         let port =
-            u16::from_be_bytes([value[2], value[3]])
-                ^ ((MAGIC_COOKIE >> 16) as u16);
+            encoded_port ^ ((MAGIC_COOKIE >> 16) as u16);
 
         let cookie = MAGIC_COOKIE.to_be_bytes();
 
@@ -373,18 +522,26 @@ fn parse_xor_mapped_address(
         return Some(SocketAddr::from((ip, port)));
     }
 
+    // ---------------------------------------------------------
     // IPv6
+    // ---------------------------------------------------------
+
     if family == 0x02 && value.len() >= 20 {
+        let encoded_port =
+            u16::from_be_bytes([
+                value[2],
+                value[3],
+            ]);
+
         let port =
-            u16::from_be_bytes([value[2], value[3]])
-                ^ ((MAGIC_COOKIE >> 16) as u16);
+            encoded_port ^ ((MAGIC_COOKIE >> 16) as u16);
 
         let cookie = MAGIC_COOKIE.to_be_bytes();
 
         let mut mask = [0u8; 16];
 
-        mask[..4].copy_from_slice(&cookie);
-        mask[4..].copy_from_slice(transaction_id);
+        mask[0..4].copy_from_slice(&cookie);
+        mask[4..16].copy_from_slice(transaction_id);
 
         let mut ip = [0u8; 16];
 
@@ -399,7 +556,7 @@ fn parse_xor_mapped_address(
 }
 
 // =============================================================
-// MAPPED-ADDRESS
+// Parse MAPPED-ADDRESS
 // =============================================================
 
 fn parse_mapped_address(value: &[u8]) -> Option<SocketAddr> {
@@ -409,10 +566,20 @@ fn parse_mapped_address(value: &[u8]) -> Option<SocketAddr> {
 
     let family = value[1];
 
+    // IPv4
     if family == 0x01 {
-        let port = u16::from_be_bytes([value[2], value[3]]);
+        let port =
+            u16::from_be_bytes([
+                value[2],
+                value[3],
+            ]);
 
-        let ip = [value[4], value[5], value[6], value[7]];
+        let ip = [
+            value[4],
+            value[5],
+            value[6],
+            value[7],
+        ];
 
         return Some(SocketAddr::from((ip, port)));
     }
@@ -421,34 +588,38 @@ fn parse_mapped_address(value: &[u8]) -> Option<SocketAddr> {
 }
 
 // =============================================================
-// Transaction ID generation
+// Transaction ID
 // =============================================================
 
-fn generate_transaction_id(socket: &UdpSocket) -> [u8; 12] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
+fn generate_transaction_id(
+    socket: &UdpSocket,
+) -> [u8; 12] {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
     let nanos = now.as_nanos();
 
-    let local_port = socket
-        .local_addr()
-        .map(|a| a.port() as u128)
-        .unwrap_or(0);
+    let local_port =
+        socket
+            .local_addr()
+            .map(|address| address.port() as u128)
+            .unwrap_or(0);
 
-    let mut value = nanos ^ (local_port << 32);
+    let mut value =
+        nanos ^ (local_port << 32);
 
     let mut result = [0u8; 12];
 
-    for byte in result.iter_mut() {
+    for byte in &mut result {
+        // Simple mixing for this test program.
         value ^= value << 13;
         value ^= value >> 7;
         value ^= value << 17;
 
         *byte = value as u8;
-        value >>= 1;
+
+        value = value.rotate_left(11);
     }
 
     result
